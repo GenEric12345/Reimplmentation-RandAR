@@ -44,10 +44,10 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     return npz_path
 
 @torch.inference_mode()
-def generate_ordering(c_indices, cfg_scales, runs, gpt_model, args):
+def generate_ordering(c_indices, cfg_scales, gpt_model, args):
 
     entropy_sum = None
-    for i in range(runs):
+    for i in range(args.runs):
         indices, logits = gpt_model.generate_with_logits(
             cond=c_indices,
             token_order=None,
@@ -68,7 +68,7 @@ def generate_ordering(c_indices, cfg_scales, runs, gpt_model, args):
         del indices, logits, probs, entropy
         torch.cuda.empty_cache()
 
-    avg_entropy = entropy_sum/runs
+    avg_entropy = entropy_sum/args.runs
     token_order = torch.argsort(avg_entropy, dim=-1)  # [bs, block_size]
 
     return token_order
@@ -122,7 +122,7 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
         c_indices = torch.randint(0, args.num_classes, (args.per_proc_batch_size,), device=device)
         cfg_scales = (1.0, cfg_scale)
 
-        token_order = generate_ordering(c_indices, cfg_scales, 8, gpt_model, args)
+        token_order = generate_ordering(c_indices, cfg_scales, gpt_model, args)
 
         indices = gpt_model.generate(
             cond=c_indices,
@@ -291,6 +291,7 @@ if __name__ == "__main__":
     parser.add_argument("--top-p", type=float, default=1.0, help="top-p value to sample with")
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--ref-path", type=str, default="/tmp/VIRTUAL_imagenet256_labeled.npz")
+    parser.add_argument("--runs", type=int, default=8)
     # output results
     parser.add_argument("--results-path", type=str, default="./results")
     args = parser.parse_args()
