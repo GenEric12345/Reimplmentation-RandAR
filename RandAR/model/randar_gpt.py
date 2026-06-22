@@ -136,6 +136,55 @@ class Attention(nn.Module):
         output = self.resid_dropout(self.wo(output))
         return output
 
+    def forward_with_attn(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor = None,
+        input_pos: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+    ):
+        """Like forward() but also returns averaged attention weights [bsz, n_head, q_len, kv_len]."""
+        bsz, seqlen, _ = x.shape
+        kv_size = self.n_kv_head * self.head_dim
+        xq, xk, xv = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
+
+        xq = xq.view(bsz, seqlen, self.n_head, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_kv_head, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_kv_head, self.head_dim)
+
+        xq = batch_apply_rotary_emb(xq, freqs_cis)
+        xk = batch_apply_rotary_emb(xk, freqs_cis)
+
+        xq, xk, xv = map(lambda x: x.transpose(1, 2), (xq, xk, xv))
+
+        if self.kv_cache is not None:
+            keys, values = self.kv_cache.update(input_pos, xk, xv)
+            max_pos = torch.max(input_pos) + 1
+            keys = keys[:, :, :max_pos]
+            values = values[:, :, :max_pos]
+            if mask is not None:
+                mask = mask[:, :, :, :max_pos]
+        else:
+            keys, values = xk, xv
+
+        keys = keys.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
+        values = values.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
+
+        # Manual attention to expose weights
+        scale = self.head_dim ** -0.5
+        attn_scores = torch.matmul(xq, keys.transpose(-2, -1)) * scale  # [bsz, n_head, q_len, kv_len]
+        if mask is not None:
+            attn_scores = attn_scores.masked_fill(~mask, float('-inf'))
+        else:
+            causal_mask = torch.ones(seqlen, keys.shape[2], dtype=torch.bool, device=x.device).tril()
+            attn_scores = attn_scores.masked_fill(~causal_mask, float('-inf'))
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # [bsz, n_head, q_len, kv_len]
+        output = torch.matmul(attn_weights, values)  # [bsz, n_head, q_len, head_dim]
+
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
+        output = self.resid_dropout(self.wo(output))
+        return output, attn_weights
+
 
 """ Cloned from LLaMAGen: only the attention uses our customized version
 """
@@ -446,6 +495,38 @@ class RandARTransformer(nn.Module):
         h = self.norm(h)
         logits = self.output(h).float()
         return logits
+
+    def forward_inference_with_attn(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        input_pos: torch.Tensor,
+    ):
+        """Like forward_inference() but also returns attention weights averaged over all layers and heads.
+
+        Returns:
+            logits: [bs, q_len, vocab_size]
+            avg_attn: [bs, q_len, kv_len] averaged over layers and heads
+        """
+        bs = x.shape[0]
+        mask = self.causal_mask[:bs, None, input_pos]
+        h = x
+        attn_sum = None
+        for layer in self.layers:
+            h_normed = layer.attention_norm(h)
+            attn_out, attn_weights = layer.attention.forward_with_attn(h_normed, freqs_cis, input_pos, mask)
+            h = h + layer.drop_path(attn_out)
+            h = h + layer.drop_path(layer.feed_forward(layer.ffn_norm(h)))
+            # attn_weights: [bs, n_head, q_len, kv_len] — average over heads
+            layer_avg = attn_weights.mean(dim=1)  # [bs, q_len, kv_len]
+            if attn_sum is None:
+                attn_sum = layer_avg
+            else:
+                attn_sum = attn_sum + layer_avg
+        avg_attn = attn_sum / len(self.layers)  # [bs, q_len, kv_len]
+        h = self.norm(h)
+        logits = self.output(h).float()
+        return logits, avg_attn
 
     def get_position_instruction_tokens(self, token_order):
         position_instruct_tokens = self.pos_instruct_embeddings.view(1, 1, self.n_head, self.dim // self.n_head)
@@ -796,6 +877,159 @@ class RandARTransformer(nn.Module):
         result_indices = torch.gather(result_indices.unsqueeze(-1), 1, reverse_permutation).squeeze(-1)
         result_entropy = torch.gather(result_entropy, 1, reverse_permutation.squeeze(-1))
         return result_indices, result_entropy
+
+    def generate_with_attention(
+        self,
+        cond: torch.Tensor,
+        token_order: torch.Tensor,
+        cfg_scales: Tuple[float, float] = (1.0, 1.0),
+        num_inference_steps: int = 88,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+    ):
+        """Like generate() but also returns per-token attention over previously revealed tokens.
+
+        Attention is averaged over all layers and all heads. For each generated token at
+        generation step i, we record its attention (summed over the [pos_instr, img] KV pair)
+        to each of the i preceding context image tokens.
+
+        Returns:
+            result_indices:    [original_bs, block_size] sampled tokens in raster order
+            result_attentions: list[original_bs] of list[block_size] of 1-D float tensors.
+                               result_attentions[b][i] has length i: the attention that
+                               generation-step i's query paid to generation steps 0..i-1.
+                               Stored in generation order; use token_order to map to raster.
+        """
+        original_bs = cond.shape[0]
+        bs = original_bs
+        use_cfg = cfg_scales[-1] > 1.0
+
+        # Step-1: token order
+        if token_order is None:
+            token_order = torch.arange(self.block_size, device=cond.device)
+            token_order = token_order.unsqueeze(0).repeat(bs, 1)
+            if self.position_order == "random":
+                for i in range(bs):
+                    token_order[i] = token_order[i][torch.randperm(self.block_size)]
+            token_order = token_order.contiguous()
+        else:
+            assert token_order.shape == (bs, self.block_size)
+
+        result_indices = torch.zeros((bs, self.block_size), dtype=torch.long, device=cond.device)
+
+        # result_attentions[b][gen_step] = 1-D tensor of length gen_step
+        result_attentions = [[torch.zeros(0, dtype=torch.float32) for _ in range(self.block_size)]
+                             for _ in range(bs)]
+
+        # Step-2: embeddings
+        position_instruction_tokens = self.get_position_instruction_tokens(token_order)
+        img_token_freq_cis = self.freqs_cis[self.cls_token_num:].clone().to(token_order.device)[token_order]
+
+        # Step-3: CFG
+        if use_cfg:
+            cond_null = torch.ones_like(cond) * self.num_classes
+            cond_combined = torch.cat([cond, cond_null])
+            img_token_freq_cis = torch.cat([img_token_freq_cis, img_token_freq_cis])
+            position_instruction_tokens = torch.cat([position_instruction_tokens, position_instruction_tokens])
+            bs *= 2
+        else:
+            cond_combined = cond
+        cond_combined_tokens = self.cls_embedding(cond_combined, train=False)
+
+        # Step-4: KV cache
+        max_seq_len = cond_combined_tokens.shape[1] + self.block_size * 2
+        with torch.device(cond.device):
+            self.setup_caches(max_batch_size=bs, max_seq_length=max_seq_len, dtype=self.tok_embeddings.weight.dtype)
+
+        if num_inference_steps == -1:
+            num_inference_steps = self.block_size
+
+        C = self.cls_token_num  # KV offset: pos_q[i] lives at C+2*i, img[i] at C+2*i+1
+
+        cur_inference_step = 0
+        num_query_token_cur_step = 1
+        query_token_idx_cur_step = 0
+
+        x = torch.cat([cond_combined_tokens,
+                       position_instruction_tokens[:, 0:1]], dim=1)
+        cur_freqs_cis = torch.cat([self.freqs_cis[:C].unsqueeze(0).repeat(bs, 1, 1, 1),
+                                   img_token_freq_cis[:, 0:1]], dim=1)
+        input_pos = torch.arange(0, x.shape[1], device=cond.device)
+
+        while query_token_idx_cur_step <= self.block_size - num_query_token_cur_step and query_token_idx_cur_step <= self.block_size - 1:
+            k = query_token_idx_cur_step
+            m = num_query_token_cur_step
+
+            logits, avg_attn = self.forward_inference_with_attn(x, cur_freqs_cis, input_pos)
+            # avg_attn: [bs, q_len, kv_len]
+
+            # CFG
+            if use_cfg:
+                cur_cfg_scale = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * k / self.block_size
+                cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
+                logits = uncond_logits + cur_cfg_scale * (cond_logits - uncond_logits)
+                # Use conditional-batch attention for visualization
+                avg_attn = avg_attn[:original_bs]
+
+            logits = logits[:, -m:]
+            indices = torch.zeros(original_bs, m, dtype=torch.long, device=cond.device)
+            for i in range(m):
+                indices[:, i:i+1] = sample(logits[:, i:i+1], temperature=temperature, top_k=top_k, top_p=top_p)[0]
+
+            result_indices[:, k:k+m] = indices.clone()
+
+            # Extract attention for each query token in this step
+            # Query for gen step k+j is at x position q_len-m+j
+            if k > 0:
+                ctx_kv_pos_q = torch.arange(k, device=cond.device) * 2 + C    # [C, C+2, ..., C+2*(k-1)]
+                ctx_kv_pos_img = ctx_kv_pos_q + 1                              # [C+1, C+3, ..., C+2*(k-1)+1]
+                for j in range(m):
+                    q_idx = avg_attn.shape[1] - m + j  # position of this query in avg_attn
+                    attn_to_ctx = avg_attn[:, q_idx, ctx_kv_pos_q] + avg_attn[:, q_idx, ctx_kv_pos_img]  # [bs_orig, k]
+                    for b in range(original_bs):
+                        result_attentions[b][k + j] = attn_to_ctx[b].cpu()
+
+            img_tokens = self.tok_embeddings(indices)
+            if use_cfg:
+                img_tokens = torch.cat([img_tokens, img_tokens], dim=0)
+
+            cur_inference_step += 1
+            num_query_token_next_step = calculate_num_query_tokens_for_parallel_decoding(
+                cur_inference_step, num_inference_steps, self.block_size,
+                k, m)
+
+            x = torch.zeros(bs, 2 * m - 1 + num_query_token_next_step, self.dim, dtype=x.dtype, device=cond.device)
+            x[:, :1] = img_tokens[:, :1]
+            cur_query_position_instruction_tokens = position_instruction_tokens[:, k+1:k+m]
+            x[:, 1:2*m-1][:, ::2] = cur_query_position_instruction_tokens
+            x[:, 1:2*m-1][:, 1::2] = img_tokens[:, 1:m]
+            query_token_idx_next_step = k + m
+            next_position_instruction_tokens = position_instruction_tokens[:, query_token_idx_next_step:query_token_idx_next_step+num_query_token_next_step]
+            x[:, 2*m-1:] = next_position_instruction_tokens
+
+            cur_freqs_cis = torch.zeros((bs, 2*m-1+num_query_token_next_step, *self.freqs_cis.shape[-2:]),
+                                        dtype=cur_freqs_cis.dtype, device=cond.device)
+            cur_freqs_cis[:, :1] = img_token_freq_cis[:, k:k+1]
+            cur_query_freq_cis = img_token_freq_cis[:, k+1:k+m]
+            cur_freqs_cis[:, 1:2*m-1][:, ::2] = cur_query_freq_cis
+            cur_freqs_cis[:, 1:2*m-1][:, 1::2] = cur_query_freq_cis
+            next_freq_cis = img_token_freq_cis[:, query_token_idx_next_step:query_token_idx_next_step+num_query_token_next_step]
+            cur_freqs_cis[:, 2*m-1:] = next_freq_cis
+
+            query_token_idx_cur_step = query_token_idx_next_step
+            if query_token_idx_cur_step > self.block_size:
+                break
+
+            last_input_pos = input_pos[input_pos.shape[0] - m]
+            input_pos = torch.arange(2*m-1+num_query_token_next_step, device=cond.device, dtype=torch.long) + last_input_pos + 1
+            num_query_token_cur_step = num_query_token_next_step
+
+        # Reorder indices to raster order
+        reverse_permutation = torch.argsort(token_order, dim=-1).long().unsqueeze(-1).expand(-1, -1, 1)
+        result_indices = torch.gather(result_indices.unsqueeze(-1), 1, reverse_permutation).squeeze(-1)
+
+        return result_indices, result_attentions
 
     def generate_parallel(
         self,

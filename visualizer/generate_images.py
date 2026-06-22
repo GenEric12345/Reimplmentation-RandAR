@@ -127,15 +127,46 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       align-items: flex-start;
       width: 100%;
     }
-    #main-image {
+    #image-wrap {
+      position: relative;
       width: 360px;
       height: 360px;
       flex-shrink: 0;
       border-radius: 8px;
       border: 2px solid #1e3a6e;
-      image-rendering: pixelated;
+      overflow: hidden;
       background: #111;
+    }
+    #main-image {
+      width: 360px;
+      height: 360px;
+      image-rendering: pixelated;
       display: block;
+    }
+    #attn-canvas {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      display: none;
+      pointer-events: none;
+    }
+    #click-overlay {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      cursor: crosshair;
+    }
+    #attn-hint {
+      position: absolute;
+      bottom: 4px; left: 50%;
+      transform: translateX(-50%);
+      font-size: 0.65rem;
+      color: #aaa;
+      background: rgba(0,0,0,0.55);
+      padding: 2px 8px;
+      border-radius: 8px;
+      pointer-events: none;
+      white-space: nowrap;
     }
     .notes-panel {
       flex: 1;
@@ -150,9 +181,21 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       text-transform: uppercase;
       letter-spacing: 0.08em;
     }
+    #attn-info {
+      background: #12182e;
+      border: 1px solid #1e3a6e;
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-size: 0.82rem;
+      line-height: 1.5;
+      color: #aaa;
+      min-height: 60px;
+      white-space: pre-wrap;
+    }
+    #attn-info.active { color: #e0e0e0; border-color: #e9456066; }
     .notes-text {
       flex: 1;
-      min-height: 330px;
+      min-height: 240px;
       background: #12182e;
       border: 1px solid #1e3a6e;
       border-radius: 6px;
@@ -248,13 +291,20 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="viewer" id="viewer" style="display:none">
         <div class="class-badge" id="class-badge">Class —</div>
         <div class="image-row">
-          <img id="main-image" src="" alt="Generated image">
+          <div id="image-wrap">
+            <img id="main-image" src="" alt="Generated image">
+            <canvas id="attn-canvas"></canvas>
+            <div id="click-overlay"></div>
+            <div id="attn-hint">Click a revealed token to see its attention</div>
+          </div>
           <div class="notes-panel">
-            <div class="notes-label">Notes / Description</div>
-            <pre class="notes-text">
-            - The image shown is generated in confidence order (not necessarily in 256 steps)
-            - It is generated with strictly causal attention on previously generated tokens (starting with just the class ID) 
-            </pre>
+            <div class="notes-label">Attention Info</div>
+            <div id="attn-info">Click a revealed token on the image to view its attention heatmap over the context.</div>
+            <div class="notes-label" style="margin-top:8px">Notes</div>
+            <pre class="notes-text">- Image generated in confidence order
+- Causal attention on previously generated tokens
+- Click any revealed patch to show which patches the model attended to when generating it
+- Heatmap: black=low, red=high attention (normalized per token)</pre>
           </div>
         </div>
         <div class="controls">
@@ -279,6 +329,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
             <button class="btn" id="btn-prev">&#8249; Prev</button>
             <button class="btn" id="btn-next">Next &#8250;</button>
             <button class="btn" id="btn-end" title="Jump to full image">Full</button>
+            <button class="btn" id="btn-clear-attn" title="Clear attention heatmap">Clear Heatmap</button>
           </div>
         </div>
       </div>
@@ -290,6 +341,140 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     let selectedId = 0;
     let playing = false;
     let playTimer = null;
+    let attnCache = {};  // imgId -> {attn: [[...]]}
+    let currentAttnGenStep = -1;
+
+    const GRID = 16;
+    const IMG_PX = 360;
+
+    // ── Heatmap color: black → deep red → orange → yellow (fire)
+    function heatColor(v) {
+      // v in [0,1]
+      const r = Math.min(255, Math.round(v * 2 * 255));
+      const g = Math.min(255, Math.round(Math.max(0, v * 2 - 1) * 255));
+      const a = Math.round(0.82 * 255 * Math.pow(v, 0.6));
+      return [r, g, 0, a];
+    }
+
+    function clearHeatmap() {
+      const canvas = document.getElementById('attn-canvas');
+      canvas.style.display = 'none';
+      currentAttnGenStep = -1;
+      document.getElementById('attn-info').className = 'attn-info';
+      document.getElementById('attn-info').textContent =
+        'Click a revealed token on the image to view its attention heatmap over the context.';
+    }
+
+    function renderHeatmap(attnValues, tokenOrder, clickedGenStep) {
+      const canvas = document.getElementById('attn-canvas');
+      // Set canvas resolution to match display size
+      canvas.width = IMG_PX;
+      canvas.height = IMG_PX;
+      canvas.style.display = 'block';
+
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, IMG_PX, IMG_PX);
+
+      const cellW = IMG_PX / GRID;
+      const cellH = IMG_PX / GRID;
+
+      // Normalize: divide by max so brightest context patch = 1
+      const maxVal = Math.max(...attnValues, 1e-10);
+
+      for (let j = 0; j < attnValues.length; j++) {
+        const rasterPos = tokenOrder[j];
+        const row = Math.floor(rasterPos / GRID);
+        const col = rasterPos % GRID;
+        const v = attnValues[j] / maxVal;
+        const [r, g, b, a] = heatColor(v);
+        ctx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',' + (a / 255).toFixed(3) + ')';
+        ctx.fillRect(col * cellW, row * cellH, cellW, cellH);
+      }
+
+      // White border on the clicked token
+      const clickedRaster = tokenOrder[clickedGenStep];
+      const cr = Math.floor(clickedRaster / GRID);
+      const cc = clickedRaster % GRID;
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(cc * cellW + 1, cr * cellH + 1, cellW - 2, cellH - 2);
+
+      currentAttnGenStep = clickedGenStep;
+    }
+
+    async function showAttentionForToken(rasterPos) {
+      const img = meta.images[selectedId];
+      const tokenOrder = img.token_order;
+
+      // Find generation step for this raster position
+      const genStep = tokenOrder.indexOf(rasterPos);
+      if (genStep < 0) return;
+
+      // Check it's revealed at the current slider position
+      const slider = document.getElementById('frame-slider');
+      const f = parseInt(slider.value);
+      const numRevealed = (meta.num_frames > 1)
+        ? Math.round(f * meta.block_size / (meta.num_frames - 1))
+        : meta.block_size;
+      if (genStep >= numRevealed) return;
+
+      // Gen step 0 has no context
+      if (genStep === 0) {
+        document.getElementById('attn-info').className = 'attn-info active';
+        document.getElementById('attn-info').textContent =
+          'Token #' + genStep + ' (raster ' + rasterPos + ') was the first generated — no image context to attend to.';
+        clearHeatmap();
+        return;
+      }
+
+      // Load attention data lazily
+      if (!attnCache[selectedId]) {
+        try {
+          const r = await fetch('images/' + pad(img.id, 4) + '/attention.json');
+          attnCache[selectedId] = await r.json();
+        } catch (e) {
+          document.getElementById('attn-info').textContent = 'Failed to load attention data.';
+          return;
+        }
+      }
+
+      const attnValues = attnCache[selectedId].attn[genStep]; // length = genStep
+
+      renderHeatmap(attnValues, tokenOrder, genStep);
+
+      // Summarize: top-3 context patches by attention weight
+      const indexed = attnValues.map((v, j) => [v, j]);
+      indexed.sort((a, b) => b[0] - a[0]);
+      const topK = indexed.slice(0, 3).map(([v, j]) => {
+        const rp = tokenOrder[j];
+        return 'patch (' + Math.floor(rp / GRID) + ',' + (rp % GRID) + ') ' + (v * 100).toFixed(1) + '%';
+      });
+
+      const el = document.getElementById('attn-info');
+      el.className = 'attn-info active';
+      el.textContent =
+        'Token #' + genStep + ' @ raster ' + rasterPos +
+        ' (row ' + Math.floor(rasterPos / GRID) + ', col ' + (rasterPos % GRID) + ')\n' +
+        'Context size: ' + attnValues.length + ' tokens\n' +
+        'Top context: ' + topK.join(' | ');
+    }
+
+    // ── Click handler on the image overlay
+    document.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('click-overlay').addEventListener('click', e => {
+        if (!meta) return;
+        const wrap = document.getElementById('image-wrap');
+        const rect = wrap.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        const col = Math.floor(x / rect.width * GRID);
+        const row = Math.floor(y / rect.height * GRID);
+        const rasterPos = row * GRID + col;
+        showAttentionForToken(rasterPos);
+      });
+
+      document.getElementById('btn-clear-attn').addEventListener('click', clearHeatmap);
+    });
 
     async function init() {
       try {
@@ -342,6 +527,8 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     function selectImage(id) {
       selectedId = id;
+      clearHeatmap();
+      attnCache = {};  // evict cache when switching images (memory)
       document.querySelectorAll('.thumb').forEach(t => t.classList.remove('active'));
       const el = document.querySelector('.thumb[data-id="' + id + '"]');
       if (el) { el.classList.add('active'); el.scrollIntoView({ block: 'nearest' }); }
@@ -371,6 +558,11 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       document.getElementById('token-count').textContent =
         numVis + ' / ' + meta.block_size + ' tokens revealed';
       document.getElementById('progress-fill').style.width = pct + '%';
+
+      // If the currently shown heatmap token is no longer revealed, clear it
+      if (currentAttnGenStep >= 0 && currentAttnGenStep >= numVis) {
+        clearHeatmap();
+      }
     }
 
     document.getElementById('frame-slider').addEventListener('input', e => {
@@ -438,6 +630,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       else if (e.key === 'ArrowUp') { if (selectedId > 0) selectImage(selectedId - 1); }
       else if (e.key === 'ArrowDown') { if (selectedId < meta.images.length - 1) selectImage(selectedId + 1); }
       else if (e.key === ' ') { e.preventDefault(); document.getElementById('btn-play').click(); }
+      else if (e.key === 'Escape') { clearHeatmap(); }
     });
 
     init();
@@ -601,9 +794,9 @@ def main(args):
             c_indices, cfg_scales, args.ordering_runs, gpt_model, args
         )
 
-        # Step 2: Final generation with confidence ordering
+        # Step 2: Final generation with confidence ordering (also captures attention)
         print("  Generating final images...")
-        result_indices = gpt_model.generate(
+        result_indices, batch_attentions = gpt_model.generate_with_attention(
             cond=c_indices,
             token_order=token_order,
             cfg_scales=cfg_scales,
@@ -634,6 +827,16 @@ def main(args):
                 Image.fromarray(frame_batch[local_idx]).save(
                     os.path.join(frames_dir, f"{frame_idx:04d}.png")
                 )
+
+            # Attention data: attn[gen_step] = list of gen_step floats
+            attn_data = {
+                "attn": [
+                    batch_attentions[local_idx][i].tolist()
+                    for i in range(block_size)
+                ]
+            }
+            with open(os.path.join(img_dir, "attention.json"), "w") as f:
+                json.dump(attn_data, f)
 
             metadata["images"].append(
                 {
