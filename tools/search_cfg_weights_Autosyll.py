@@ -122,7 +122,7 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
 
         token_order = generate_ordering(c_indices, cfg_scales, gpt_model, args)
 
-        indices = gpt_model.generate(
+        indices = gpt_model.generate_confidence_first(
             cond=c_indices,
             token_order=token_order,
             cfg_scales=cfg_scales,
