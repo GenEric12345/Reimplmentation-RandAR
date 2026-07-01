@@ -291,6 +291,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 - Causal attention on previously generated tokens
 - Click any revealed patch to show which patches the model attended to when generating it
 - Heatmap: black=low, red=high attention (normalized per token)</pre>
+- Current Problems with Visualizaer: The first token is always shown to have the greatest attention w.r.t. any cell
           </div>
         </div>
         <div class="controls">
